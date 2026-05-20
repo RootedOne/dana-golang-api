@@ -7,13 +7,19 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/googleai"
-	"github.com/tmc/langchaingo/llms/openai"
+	"golang.org/x/time/rate"
+)
+
+const (
+	modeMovie = "movie"
+	modeMusic = "music"
 )
 
 type sReq struct {
@@ -33,6 +39,24 @@ type LLMResponse struct {
 	Guesses []Guess `json:"guesses"`
 }
 
+type MusicGuess struct {
+	MusicName   string `json:"music_name"`
+	MusicArtist string `json:"music_artist"`
+	AlbumName   string `json:"album_name"`
+	ReleaseDate string `json:"release_date"`
+	AlbumCover  string `json:"album_cover"`
+	Info        string `json:"info"`
+}
+
+type MusicLLMResponse struct {
+	Guesses []MusicGuess `json:"guesses"`
+}
+
+type APIError struct {
+	Error   string `json:"error"`
+	Details string `json:"details,omitempty"`
+}
+
 // TMDB API structures
 type TMDBFindResponse struct {
 	MovieResults []TMDBResult `json:"movie_results"`
@@ -44,40 +68,91 @@ type TMDBResult struct {
 }
 
 var (
-	systemPrompt string
-	llmClient    llms.Model
-	temperature  float64
-	tmdbAPIKey   string
+	appMode          string
+	aiProvider       string
+	systemPrompt     string
+	llmClient        llms.Model
+	temperature      float64
+	tmdbAPIKey       string
+	aiAPIKey         string
+	aiModel          string
+	aiBaseURL        string
+	useOpenAICompat  bool
+	useNativeGoogle  bool
+	rateLimiter      *rate.Limiter
+	rateLimitEnabled bool
 )
 
-const fallbackCoverArt = "https://via.placeholder.com/500x750.png?text=Poster+Not+Found"
+const fallbackCoverArt = "https://via.placeholder.com/500x750.png?text=Cover+Not+Found"
 const tmdbImageBaseURL = "https://image.tmdb.org/t/p/w500"
 
 func initEnv() {
-	promptData, err := os.ReadFile("prompts/system.xml")
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("MODE")))
+	if mode != modeMovie && mode != modeMusic {
+		log.Fatal("MODE environment variable is required and must be 'movie' or 'music'")
+	}
+	appMode = mode
+
+	promptFile := "prompts/system.xml"
+	if appMode == modeMusic {
+		promptFile = "prompts/music.xml"
+	}
+
+	promptData, err := os.ReadFile(promptFile)
 	if err != nil {
-		log.Fatalf("Failed to read system prompt: %v", err)
+		log.Fatalf("Failed to read system prompt (%s): %v", promptFile, err)
 	}
 	systemPrompt = string(promptData)
+	log.Printf("MODE=%s prompt=%s", appMode, promptFile)
 
-	provider := os.Getenv("AI_PROVIDER")
-	if provider == "" {
-		provider = "google"
+	aiProvider = strings.ToLower(strings.TrimSpace(os.Getenv("AI_PROVIDER")))
+	if aiProvider == "" {
+		aiProvider = "google"
 	}
 
-	model := os.Getenv("AI_MODEL")
-	if model == "" {
-		model = "gemini-2.0-flash-lite-preview-02-05"
+	aiModel = os.Getenv("AI_MODEL")
+	if aiModel == "" {
+		aiModel = "gemini-2.0-flash-lite-preview-02-05"
 	}
 
-	apiKey := os.Getenv("AI_API_KEY")
-	if apiKey == "" {
+	aiAPIKey = os.Getenv("AI_API_KEY")
+	if aiAPIKey == "" {
 		log.Fatal("AI_API_KEY environment variable is required")
 	}
 
-	tmdbAPIKey = os.Getenv("TMDB_API_KEY")
-	if tmdbAPIKey == "" {
-		log.Println("Warning: TMDB_API_KEY is not set. Fallback posters will be used.")
+	aiBaseURL = strings.TrimSpace(os.Getenv("AI_BASE_URL"))
+	useOpenAICompat = aiBaseURL != "" || aiProvider == "openai"
+	useNativeGoogle = aiProvider == "google" && aiBaseURL == ""
+
+	if useOpenAICompat {
+		if aiBaseURL == "" {
+			aiBaseURL = "https://api.openai.com/v1"
+		}
+		log.Printf("LLM backend: OpenAI-compatible HTTP (%s)", normalizeChatCompletionsURL(aiBaseURL))
+	} else if useNativeGoogle {
+		ctx := context.Background()
+		client, err := googleai.New(
+			ctx,
+			googleai.WithAPIKey(aiAPIKey),
+			googleai.WithDefaultModel(aiModel),
+		)
+		if err != nil {
+			log.Fatalf("Failed to initialize Google AI client: %v", err)
+		}
+		llmClient = client
+		log.Printf("LLM backend: Google Gemini native (model=%s)", aiModel)
+		if appMode == modeMusic {
+			log.Println("Music mode: Google Search grounding enabled for LLM requests")
+		}
+	} else {
+		log.Fatalf("Unsupported AI_PROVIDER: %s. Use 'google' (no AI_BASE_URL) or 'openai'/Groq with AI_BASE_URL", aiProvider)
+	}
+
+	if appMode == modeMovie {
+		tmdbAPIKey = os.Getenv("TMDB_API_KEY")
+		if tmdbAPIKey == "" {
+			log.Println("Warning: TMDB_API_KEY is not set. Fallback posters will be used.")
+		}
 	}
 
 	tempStr := os.Getenv("AI_TEMPERATURE")
@@ -92,45 +167,63 @@ func initEnv() {
 		temperature = 0.1
 	}
 
-	ctx := context.Background()
+	initRateLimiter()
+}
 
-	switch provider {
-	case "google":
-		client, err := googleai.New(
-			ctx,
-			googleai.WithAPIKey(apiKey),
-			googleai.WithDefaultModel(model),
-		)
-		if err != nil {
-			log.Fatalf("Failed to initialize Google AI client: %v", err)
+func initRateLimiter() {
+	enabledStr := strings.ToLower(strings.TrimSpace(os.Getenv("RATE_LIMIT_ENABLED")))
+	rateLimitEnabled = enabledStr == "true" || enabledStr == "1"
+
+	if !rateLimitEnabled {
+		log.Println("Rate limiting disabled")
+		return
+	}
+
+	requests := 20
+	windowSec := 60
+
+	if v := os.Getenv("RATE_LIMIT_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			requests = n
 		}
-		llmClient = client
-
-	case "openai":
-		opts := []openai.Option{
-			openai.WithModel(model),
-			openai.WithToken(apiKey),
+	}
+	if v := os.Getenv("RATE_LIMIT_WINDOW_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			windowSec = n
 		}
+	}
 
-		baseURL := os.Getenv("AI_BASE_URL")
-		if baseURL != "" {
-			opts = append(opts, openai.WithBaseURL(baseURL))
-		}
+	limit := rate.Limit(float64(requests) / float64(windowSec))
+	rateLimiter = rate.NewLimiter(limit, requests)
+	log.Printf("Rate limiting enabled: %d requests per %d seconds", requests, windowSec)
+}
 
-		client, err := openai.New(opts...)
-		if err != nil {
-			log.Fatalf("Failed to initialize OpenAI client: %v", err)
-		}
-		llmClient = client
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
 
-	default:
-		log.Fatalf("Unsupported AI_PROVIDER: %s. Must be 'google' or 'openai'", provider)
+func writeJSONError(w http.ResponseWriter, status int, message, details string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body := APIError{Error: message, Details: details}
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Printf("[%s] failed to encode error response: %v", appMode, err)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("[%s] failed to encode response: %v", appMode, err)
 	}
 }
 
 func cleanJSONResponse(raw string) string {
 	cleaned := strings.TrimSpace(raw)
-	// Remove markdown block if present
 	if strings.HasPrefix(cleaned, "```json") {
 		cleaned = strings.TrimPrefix(cleaned, "```json")
 	} else if strings.HasPrefix(cleaned, "```") {
@@ -140,6 +233,41 @@ func cleanJSONResponse(raw string) string {
 		cleaned = strings.TrimSuffix(cleaned, "```")
 	}
 	return strings.TrimSpace(cleaned)
+}
+
+func generateWithNativeGoogle(ctx context.Context, query string) (string, error) {
+	content := []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt),
+		llms.TextParts(llms.ChatMessageTypeHuman, query),
+	}
+
+	resp, err := llmClient.GenerateContent(ctx, content, llms.WithTemperature(temperature))
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response choices returned")
+	}
+
+	return resp.Choices[0].Content, nil
+}
+
+// generateLLM routes to OpenAI-compatible HTTP or native Google based on env.
+func generateLLM(ctx context.Context, query string) (string, error) {
+	if useOpenAICompat {
+		return generateOpenAIChatCompletion(ctx, aiBaseURL, aiAPIKey, aiModel, systemPrompt, query, temperature)
+	}
+
+	if useNativeGoogle && appMode == modeMusic {
+		return generateMusicWithGoogleSearch(ctx, aiAPIKey, aiModel, systemPrompt, query, temperature)
+	}
+
+	if useNativeGoogle {
+		return generateWithNativeGoogle(ctx, query)
+	}
+
+	return "", fmt.Errorf("no LLM backend configured")
 }
 
 func fetchTMDBPoster(imdbID string) string {
@@ -181,53 +309,81 @@ func fetchTMDBPoster(imdbID string) string {
 	return fallbackCoverArt
 }
 
+func isValidCoverURL(s string) bool {
+	if s == "" || s == "null" {
+		return false
+	}
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+func normalizeMusicCovers(resp *MusicLLMResponse) {
+	for i, guess := range resp.Guesses {
+		if strings.HasPrefix(guess.Info, "SYSTEM ERROR") {
+			resp.Guesses[i].AlbumCover = fallbackCoverArt
+			continue
+		}
+		if !isValidCoverURL(guess.AlbumCover) {
+			resp.Guesses[i].AlbumCover = fallbackCoverArt
+		}
+	}
+}
+
 func handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+		return
+	}
+
+	if rateLimitEnabled && rateLimiter != nil && !rateLimiter.Allow() {
+		log.Printf("[%s] rate limit exceeded", appMode)
+		writeJSONError(w, http.StatusTooManyRequests, "Rate limit exceeded", "Too many requests; try again later")
 		return
 	}
 
 	var req sReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		log.Printf("[%s] invalid JSON payload: %v", appMode, err)
+		writeJSONError(w, http.StatusBadRequest, "Invalid JSON payload", err.Error())
 		return
 	}
 
 	if req.Query == "" {
-		http.Error(w, "Query is required", http.StatusBadRequest)
+		log.Printf("[%s] empty query rejected", appMode)
+		writeJSONError(w, http.StatusBadRequest, "Query is required", "")
 		return
 	}
 
-	ctx := context.Background()
-	content := []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt),
-		llms.TextParts(llms.ChatMessageTypeHuman, req.Query),
+	switch appMode {
+	case modeMovie:
+		handleMovieSearch(w, r, req)
+	case modeMusic:
+		handleMusicSearch(w, r, req)
+	default:
+		writeJSONError(w, http.StatusInternalServerError, "Invalid service mode", appMode)
 	}
+}
 
-	resp, err := llmClient.GenerateContent(ctx, content, llms.WithTemperature(temperature))
+func handleMovieSearch(w http.ResponseWriter, r *http.Request, req sReq) {
+	ctx := r.Context()
+
+	resultText, err := generateLLM(ctx, req.Query)
 	if err != nil {
-		log.Printf("Error generating content: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		log.Printf("[movie] LLM generation failed query_len=%d err=%v", len(req.Query), err)
+		writeJSONError(w, http.StatusInternalServerError, "Failed to generate content", err.Error())
 		return
 	}
 
-	if len(resp.Choices) == 0 {
-		http.Error(w, "No response generated", http.StatusInternalServerError)
-		return
-	}
-
-	resultText := cleanJSONResponse(resp.Choices[0].Content)
+	resultText = cleanJSONResponse(resultText)
 
 	var llmResp LLMResponse
 	if err := json.Unmarshal([]byte(resultText), &llmResp); err != nil {
-		log.Printf("Error parsing JSON from LLM: %v\nRaw output: %s", err, resultText)
-		http.Error(w, "Failed to parse generation response", http.StatusInternalServerError)
+		log.Printf("[movie] JSON parse failed query_len=%d err=%v raw_prefix=%q", len(req.Query), err, truncate(resultText, 200))
+		writeJSONError(w, http.StatusInternalServerError, "Failed to parse generation response", err.Error())
 		return
 	}
 
-	// Enrich with TMDB Posters
 	for i, guess := range llmResp.Guesses {
-		// Only try to fetch if we have an IMDB ID and it's not the "SYSTEM ERROR" out-of-bounds message
 		if guess.ImdbID != "" && guess.ImdbID != "null" && !strings.HasPrefix(guess.Info, "SYSTEM ERROR") {
 			llmResp.Guesses[i].FilmCoverArt = fetchTMDBPoster(guess.ImdbID)
 		} else {
@@ -235,16 +391,33 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	finalResp, err := json.Marshal(llmResp)
+	log.Printf("[movie] success query_len=%d guesses=%d", len(req.Query), len(llmResp.Guesses))
+	writeJSON(w, http.StatusOK, llmResp)
+}
+
+func handleMusicSearch(w http.ResponseWriter, r *http.Request, req sReq) {
+	ctx := r.Context()
+
+	resultText, err := generateLLM(ctx, req.Query)
 	if err != nil {
-		log.Printf("Error marshaling final response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		log.Printf("[music] LLM generation failed query_len=%d err=%v", len(req.Query), err)
+		writeJSONError(w, http.StatusInternalServerError, "Failed to generate content", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(finalResp)
+	resultText = cleanJSONResponse(resultText)
+
+	var llmResp MusicLLMResponse
+	if err := json.Unmarshal([]byte(resultText), &llmResp); err != nil {
+		log.Printf("[music] JSON parse failed query_len=%d err=%v raw_prefix=%q", len(req.Query), err, truncate(resultText, 200))
+		writeJSONError(w, http.StatusInternalServerError, "Failed to parse generation response", err.Error())
+		return
+	}
+
+	normalizeMusicCovers(&llmResp)
+
+	log.Printf("[music] success query_len=%d guesses=%d", len(req.Query), len(llmResp.Guesses))
+	writeJSON(w, http.StatusOK, llmResp)
 }
 
 func main() {
@@ -253,7 +426,7 @@ func main() {
 	http.HandleFunc("/sReq", handleSearch)
 
 	port := "8080"
-	log.Printf("Starting CineSearch Pro service on port %s...", port)
+	log.Printf("Starting dana-api in %s mode on port %s...", appMode, port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}

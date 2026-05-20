@@ -1,31 +1,31 @@
-# CineSearch Pro
+# Dana API
 
-CineSearch Pro is a robust, production-ready microservice built in Go that identifies movies and television series based on natural language queries. It leverages a powerful dual-engine approach to return structured, deterministic JSON data for seamless backend integration.
+Dana API is a Go microservice that identifies **movies/TV** or **music** from natural language queries, depending on `MODE`. It returns structured JSON for backend integration.
 
 ## Architecture & Features
 
-- **Dual-Engine Pipeline:** Utilizes an LLM engine for highly accurate natural language deduction and metadata extraction, seamlessly paired with the TMDB API to verify the `imdb_id` and fetch official, high-quality cover art.
-- **Model Agnostic:** Built on top of `langchaingo`, allowing you to effortlessly switch between Google and OpenAI-compatible models.
-- **Universal Provider Support:** Not limited to just OpenAI. By configuring the `AI_BASE_URL`, you can connect to local models (e.g., Ollama) or other compatible API providers (e.g., Groq, Together.ai) using standard OpenAI tooling.
-- **Externalized Prompting:** The core instruction set and boundaries are maintained in a clean XML format at `prompts/system.xml`, making it easy to tweak the service's persona without touching Go code.
-- **Robust Parsing:** Built-in safeguards automatically strip Markdown wrappers and sanitize outputs to guarantee standard JSON structures.
-- **Dockerized:** Includes a multi-stage Dockerfile for lightweight, secure, and rapid deployments without requiring local build tools.
+- **Dual modes:** `MODE=movie` (CineSearch) or `MODE=music` (MusicSearch) — each with its own XML prompt and response schema.
+- **Movie pipeline:** LLM identification + TMDB poster enrichment via `imdb_id`.
+- **Music pipeline:** LLM identification with album metadata and cover URLs; Google Search grounding when `AI_PROVIDER=google`.
+- **Model agnostic:** OpenAI-compatible HTTP (`Authorization: Bearer`, `messages` schema) for Groq, DeepSeek, OpenAI, etc. via `AI_BASE_URL`. Native Google Gemini only when `AI_PROVIDER=google` and `AI_BASE_URL` is empty.
+- **Rate limiting:** Configurable global limiter to protect AI API quota.
+- **Structured errors:** All API errors return JSON `{"error":"...","details":"..."}` with detailed server logs.
+- **Dockerized:** Multi-stage Dockerfile for lightweight deployments.
 
 ## Prerequisites
 
 - Go 1.22+
-- Docker and Docker Compose (optional, for containerized deployment)
+- Docker and Docker Compose (optional)
 
 ## Setup and Configuration
 
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/RootedOne/dana-api
-   cd cinesearch-pro
+   cd dana-api
    ```
 
 2. **Environment Configuration:**
-   Copy the example environment file and fill in your details:
    ```bash
    cp .env.example .env
    ```
@@ -34,18 +34,24 @@ CineSearch Pro is a robust, production-ready microservice built in Go that ident
 
    | Variable | Description | Default |
    |----------|-------------|---------|
-   | `AI_PROVIDER` | The LLM provider to use (`google` or `openai`). | `google` |
-   | `AI_MODEL` | The specific model identifier. | `gemini-2.0-flash-lite-preview-02-05` |
-   | `AI_API_KEY` | Your authentication key for the chosen provider. | **Required** |
-   | `AI_BASE_URL` | Optional endpoint override for OpenAI-compatible services. | (Empty) |
-   | `AI_TEMPERATURE` | Generation temperature. Lower values produce more deterministic JSON. | `0.1` |
-   | `TMDB_API_KEY` | API Key for The Movie Database (used for cover art). | **Required** |
+   | `AI_PROVIDER` | `google` (native Gemini, no base URL) or `openai` (compatible APIs). | `openai` |
+   | `AI_MODEL` | Model identifier. | provider-specific |
+   | `AI_API_KEY` | API key (`Authorization: Bearer`). | **Required** |
+   | `AI_BASE_URL` | OpenAI-compatible base (e.g. `https://api.groq.com/openai/v1`). **Required for Groq/DeepSeek.** | (empty) |
+   | `AI_TEMPERATURE` | Generation temperature. | `0.1` |
+   | `MODE` | Service mode: `movie` or `music`. | **Required** |
+   | `RATE_LIMIT_ENABLED` | Enable request rate limiting. | `true` |
+   | `RATE_LIMIT_REQUESTS` | Max requests per window. | `20` |
+   | `RATE_LIMIT_WINDOW_SEC` | Rate limit window in seconds. | `60` |
+   | `TMDB_API_KEY` | TMDB key for movie posters (movie mode). | Recommended for movie mode |
+
+   **Movie mode:** `MODE=movie` loads `prompts/system.xml`.
+
+   **Music mode:** `MODE=music` loads `prompts/music.xml`. Uses Google Search when `AI_PROVIDER=google`.
 
 ## Running the Service
 
-### Using Docker Compose (Recommended)
-
-To build and start the service in detached mode:
+### Docker Compose (Recommended)
 
 ```bash
 docker-compose up -d --build
@@ -53,54 +59,82 @@ docker-compose up -d --build
 
 ### Running Locally
 
-To run the application directly with Go:
-
 ```bash
 go mod download
-export $(cat .env | xargs) && go run main.go
+export $(grep -v '^#' .env | xargs) && go run .
 ```
 
-The service will start and listen on `http://localhost:8080`.
+The service listens on `http://localhost:8080`.
 
 ## API Usage
-
-The service exposes a single POST endpoint.
 
 ### `POST /sReq`
 
 **Request:**
 ```json
 {
-  "query": "A futuristic movie where humans are plugged into a simulation, and the main character learns kung fu."
+  "query": "A song about a yellow submarine by the Beatles"
 }
 ```
 
-**Response (JSON):**
+#### Movie mode response (`MODE=movie`)
+
 ```json
 {
   "guesses": [
     {
-      "name": "The Matrix",
-      "date": "1999",
-      "genre": "Sci-Fi",
-      "info": "A computer hacker learns from mysterious rebels about the true nature of his reality...",
-      "imdb_id": "tt0133093",
-      "film_cover_art": "https://image.tmdb.org/t/p/w500/f89U3ADr1oiB1s9GkdPOEpXUk5H.jpg"
-    },
-    ...
+      "name": "Yellow Submarine",
+      "date": "1969",
+      "genre": "Rock",
+      "info": "...",
+      "imdb_id": "tt0063823",
+      "film_cover_art": "https://image.tmdb.org/t/p/w500/..."
+    }
   ]
 }
 ```
 
-## 🧹 Maintenance & Cleanup
+#### Music mode response (`MODE=music`)
 
-To keep your environment lean and prevent Docker storage bloat, a utility script is provided to fully tear down the service and its associated artifacts.
+```json
+{
+  "guesses": [
+    {
+      "music_name": "Yellow Submarine",
+      "music_artist": "The Beatles",
+      "album_name": "Yellow Submarine",
+      "release_date": "1969-01-17",
+      "album_cover": "https://...",
+      "info": "..."
+    }
+  ]
+}
+```
 
-### Create the Cleanup Script
+Both modes return exactly 5 guesses. Non-domain queries return a `SYSTEM ERROR` in the first guess `info` field.
 
-   ```sh
-   docker-compose down --rmi all --volumes --remove-orphans && docker builder prune -f
-   ```
+### Error responses
 
-*(Note: The system is constrained to return exactly 5 guesses based on the criteria in `prompts/system.xml`. If the TMDB lookup fails, a fallback image placeholder is provided.)*
+All errors use JSON (not plain text):
 
+```json
+{
+  "error": "Failed to parse generation response",
+  "details": "invalid character 'x' looking for beginning of value"
+}
+```
+
+| Status | Meaning |
+|--------|---------|
+| `400` | Invalid JSON or missing query |
+| `405` | Method not allowed |
+| `429` | Rate limit exceeded |
+| `500` | LLM failure, parse error, or internal error |
+
+Server logs include mode, query length, and error details (truncated raw LLM output on parse failures).
+
+## Maintenance & Cleanup
+
+```sh
+docker-compose down --rmi all --volumes --remove-orphans && docker builder prune -f
+```
