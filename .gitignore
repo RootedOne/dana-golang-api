@@ -1,1 +1,31 @@
+# Environment (secrets)
+.env
+.env.local
+.env.*.local
+
+# Binaries
 cinesearch-pro
+dana-api
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build & test
+*.test
+*.out
+coverage.out
+coverage.html
+vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
